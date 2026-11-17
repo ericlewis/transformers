@@ -40,12 +40,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 from transformers import AutoTokenizer, GenerationConfig, KlmConfig, KlmForCausalLM
-from transformers.models.klm.conversion_klm import (
-    ORIGINAL_TO_CONVERTED_KEY_MAPPING as ORIGINAL_TO_CONVERTED_KEY_MAPPING,
-)
-from transformers.models.klm.conversion_klm import (
-    convert_state_dict,
-)
+from transformers.models.klm.conversion_klm import convert_state_dict
 
 
 # Original config names that differ from the Transformers ones

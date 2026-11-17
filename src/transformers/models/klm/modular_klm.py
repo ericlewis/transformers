@@ -13,8 +13,7 @@
 # limitations under the License.
 
 import copy
-import importlib
-import inspect
+import importlib.util
 import math
 from collections.abc import Callable
 
@@ -22,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub.dataclasses import strict
+from packaging import version
 
 from ... import initialization as init
 from ...activations import ACT2FN
@@ -42,6 +42,7 @@ from ...utils import (
     is_flash_linear_attention_available,
     is_torchdynamo_compiling,
     is_torchdynamo_exporting,
+    is_tracing,
     logging,
 )
 from ...utils.deprecation import deprecate_kwarg
@@ -56,32 +57,26 @@ from ..olmo3.modeling_olmo3 import (
 )
 from ..olmo_hybrid.modeling_olmo_hybrid import OlmoHybridRotaryEmbedding
 from ..qwen3_next.modeling_qwen3_next import l2norm
-from .conversion_klm import convert_state_dict
+from .conversion_klm import convert_state_dict, is_original_state_dict
 
 
 logger = logging.get_logger(__name__)
 
 
-def _klm_fla_capabilities_available():
+def is_klm_fla_available() -> bool:
+    """Whether flash-linear-attention has the three kernels of the packed path. They came with its version 0.6.0."""
     if not is_flash_linear_attention_available():
         return False
-    requirements = (
-        ("fla.ops.gdn2", "chunk_gdn2", {"q", "k", "v", "g", "b", "w", "cu_seqlens", "use_qk_l2norm_in_kernel"}),
-        ("fla.ops.attnres", "fused_attnres", {"residuals", "output_rms_weight", "checkpoint_level"}),
-        ("fla.modules.causal_conv1d", "causal_conv1d", {"x", "weight", "cu_seqlens", "backend"}),
-    )
     try:
-        return all(
-            callable(function := getattr(importlib.import_module(module), name, None))
-            and parameters.issubset(inspect.signature(function).parameters)
-            for module, name, parameters in requirements
+        import fla
+
+        return version.parse(fla.__version__) >= version.parse("0.6.0") and all(
+            importlib.util.find_spec(name) is not None
+            for name in ("fla.ops.gdn2", "fla.ops.attnres", "fla.modules.causal_conv1d")
         )
     except Exception:
-        # Optional compiled dependencies must not prevent the portable model from loading.
+        # A broken optional dependency must not prevent the model from loading
         return False
-
-
-is_klm_fla_available = _klm_fla_capabilities_available()
 
 
 def torch_klm_fused_attnres(query, residuals, rms_weight, output_rms_weight=None, rms_eps=1e-6, checkpoint_level=1):
@@ -117,7 +112,7 @@ def torch_klm_causal_conv1d(
     starts = torch.zeros(batch_size * length, dtype=torch.bool, device=x.device)
     if cu_seqlens is not None:
         starts[cu_seqlens[:-1].long()] = True
-    first = torch.where(starts.reshape(batch_size, length), positions, 0).cummax(-1).values
+    first = torch.where(starts.reshape(batch_size, length), positions, 0).cummax(-1)[0]
     lags = torch.arange(weight.shape[-1] - 1, -1, -1, device=x.device)
     valid = (positions - first)[..., None] >= lags
     windows = F.pad(x.transpose(1, 2), (weight.shape[-1] - 1, 0)).unfold(-1, weight.shape[-1], 1)
@@ -897,28 +892,32 @@ class KlmPreTrainedModel(PreTrainedModel):
     }
 
     def load_state_dict(self, state_dict, *args, **kwargs):
-        """Accept original KLM checkpoints in direct trainer reloads as well as native state dicts."""
-        prefix = f"{self.base_model_prefix}." if self.base_model is not self else ""
-        original = tuple(prefix + name for name in ("embed.", "memory.", "blocks.", "attn_res_query", "attn_res_norm"))
-        if any(key.startswith(original) for key in state_dict):
-            native = tuple(prefix + name for name in ("embed_tokens.", "embed_ngrams.", "layers.", "output_residual."))
-            if any(key.startswith(native) for key in state_dict):
-                raise ValueError("KLM checkpoint mixes original and native parameter names.")
-            # The shared converter uses the causal-LM prefix; bare KlmModel snapshots omit it.
-            canonical = state_dict if prefix else {f"model.{key}": value for key, value in state_dict.items()}
-            with torch.no_grad():
-                converted = convert_state_dict(canonical, self.config)
-            state_dict = (
-                converted if prefix else {key.removeprefix("model."): value for key, value in converted.items()}
-            )
+        """
+        Also reads the original weight names, the ones `save_pretrained` writes by default, with or without the `model.`
+        prefix of the causal language model. A trainer that restores a checkpoint with this method keeps its parameters.
+        """
+        own_prefix = "" if self.base_model is self else f"{self.base_model_prefix}."
+        if is_original_state_dict(state_dict):
+            if any(
+                key.removeprefix("model.").startswith(("embed_tokens.", "embed_ngrams.", "layers."))
+                for key in state_dict
+            ):
+                raise ValueError("The state dict mixes original and native weight names.")
+            # The converter reads the names of the causal language model
+            prefixed = any(key.startswith("model.") for key in state_dict)
+            state_dict = state_dict if prefixed else {f"model.{key}": value for key, value in state_dict.items()}
+            state_dict = convert_state_dict(state_dict, self.config)
+            if not own_prefix:
+                state_dict = {key.removeprefix("model."): value for key, value in state_dict.items()}
             output_embeddings = self.get_output_embeddings()
+            embeddings = state_dict.get(f"{own_prefix}embed_tokens.weight")
+            # The original layout stores tied output embeddings once
             if (
                 output_embeddings is not None
                 and output_embeddings.weight is self.get_input_embeddings().weight
-                and "lm_head.weight" not in state_dict
-                and f"{prefix}embed_tokens.weight" in state_dict
+                and embeddings is not None
             ):
-                state_dict["lm_head.weight"] = state_dict[f"{prefix}embed_tokens.weight"]
+                state_dict.setdefault("lm_head.weight", embeddings)
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     @torch.no_grad()
@@ -956,7 +955,7 @@ class KlmModel(KlmPreTrainedModel):
         self.norm = KlmRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = KlmRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self._use_fla_kernels = is_klm_fla_available
+        self._use_fla_kernels = is_klm_fla_available()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1016,6 +1015,7 @@ class KlmModel(KlmPreTrainedModel):
         attention_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         use_cache: bool | None = None,
+        keep_padding: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         r"""
@@ -1029,6 +1029,10 @@ class KlmModel(KlmPreTrainedModel):
             only comes after the tokens it could affect.
 
             With a cache, include both cached and current positions in the mask.
+        keep_padding (`bool`, *optional*, defaults to `False`):
+            Whether the positions masked by `attention_mask` get hidden states when the packed kernels of
+            flash-linear-attention run. Those kernels skip them otherwise, and their hidden states are zero. Without
+            the kernels they are always computed.
         """
         if self.gradient_checkpointing and self.training and use_cache and cache is None:
             logger.warning_once(
@@ -1044,7 +1048,6 @@ class KlmModel(KlmPreTrainedModel):
         use_fla = self._can_use_fla(input_ids, cache) and not (capture_hidden or capture_attention)
         use_flash = use_fla and self._can_use_flash_attention(input_ids)
         packed_indices = None
-        keep_padding = kwargs.pop("_keep_padding", False)
         if use_flash:
             packed = self._prepare_packed_inputs(input_ids, attention_mask, keep_padding)
             if packed is None:
@@ -1086,7 +1089,7 @@ class KlmModel(KlmPreTrainedModel):
 
         # Position of the first token of the document of each token
         sequence_positions = torch.arange(seq_len, device=input_ids.device) if use_flash else position_ids
-        first_positions = torch.where(document_starts, sequence_positions, -1).cummax(dim=1).values
+        first_positions = torch.where(document_starts, sequence_positions, -1).cummax(dim=1)[0]
         if document_state is not None:
             first_positions = torch.where(first_positions < 0, document_state[:, 2], first_positions)
 
@@ -1107,9 +1110,9 @@ class KlmModel(KlmPreTrainedModel):
             attention_implementation = "sdpa"
 
         # The padding mask is left out on purpose, the document starts already account for it. Rows that hold a single
-        # document from their first position on only need the plain causal mask.
+        # document from their first position on only need the plain causal mask, a check that cannot be traced.
         and_mask_function = None
-        if not use_flash and (first_positions > 0).any():
+        if not use_flash and (is_tracing(first_positions) or (first_positions > 0).any()):
             and_mask_function = document_mask_function(first_positions, past_seen_tokens)
         if use_flash:
             causal_mask = None
@@ -1237,31 +1240,23 @@ class KlmForCausalLM(Olmo3ForCausalLM):
         >>> generated_ids = model.generate(**inputs, max_new_tokens=20)
         >>> text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
         ```"""
-        model_kwargs = kwargs
-        if (
-            attention_mask is not None
-            and self.model._can_use_fla(input_ids, cache)
-            and self.model._can_use_flash_attention(input_ids)
-        ):
-            # A padding-position logit can still predict a supervised next token (notably with left padding).
-            # Keep those positions' context instead of replacing their hidden states with the unpadding fill value.
-            model_kwargs = dict(kwargs)
+        # The logits of a padding position can still be read: by a loss computed outside the model, or by labels that
+        # supervise the token after it (with left padding). The packed kernels only skip padding when neither can be.
+        keep_padding = True
+        if labels is not None and attention_mask is not None:
             shift_labels = kwargs.get("shift_labels")
-            if labels is None:
-                # External loss functions (including Trainer's label smoother) may use padding-position logits.
-                model_kwargs["_keep_padding"] = True
+            if shift_labels is None:
+                supervised_padding = ~attention_mask[:, :-1].bool() & labels[:, 1:].ne(-100)
             else:
-                if shift_labels is None:
-                    supervised_padding = ~attention_mask[:, :-1].bool() & labels[:, 1:].ne(-100)
-                else:
-                    supervised_padding = ~attention_mask.bool() & shift_labels.ne(-100)
-                model_kwargs["_keep_padding"] = bool(supervised_padding.any())
+                supervised_padding = ~attention_mask.bool() & shift_labels.ne(-100)
+            keep_padding = bool(supervised_padding.any())
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             cache=cache,
             use_cache=use_cache,
-            **model_kwargs,
+            keep_padding=keep_padding,
+            **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
