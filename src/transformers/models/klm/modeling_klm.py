@@ -37,7 +37,7 @@ from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, slice_logits_to_keep
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_tracing
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
@@ -807,7 +807,7 @@ class KlmModel(KlmPreTrainedModel):
             document_starts[:, 0] = True
 
         # Position of the first token of the document of each token
-        first_positions = torch.where(document_starts, position_ids, -1).cummax(dim=1).values
+        first_positions = torch.where(document_starts, position_ids, -1).cummax(dim=1)[0]
         if document_state is not None:
             first_positions = torch.where(first_positions < 0, document_state[:, 2], first_positions)
 
@@ -816,9 +816,9 @@ class KlmModel(KlmPreTrainedModel):
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids[None])
 
         # The padding mask is left out on purpose, the document starts already account for it. Rows that hold a single
-        # document from their first position on only need the plain causal mask.
+        # document from their first position on only need the plain causal mask, a check that cannot be traced.
         and_mask_function = None
-        if (first_positions > 0).any():
+        if is_tracing(first_positions) or (first_positions > 0).any():
             and_mask_function = document_mask_function(first_positions, past_seen_tokens)
         causal_mask = create_causal_mask(
             config=self.config,

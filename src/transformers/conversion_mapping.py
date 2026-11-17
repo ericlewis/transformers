@@ -2552,6 +2552,9 @@ def _build_checkpoint_conversion_mapping():
             continue
         mapping[model_type] = mapping[base_pattern].copy()
 
+    # A function in place of a list builds the mapping from the config of the model being loaded
+    mapping["klm"] = _get_klm_conversion_mapping
+
     return mapping
 
 
@@ -2614,8 +2617,8 @@ def get_checkpoint_conversion_mapping(model_type, config=None):
     if _checkpoint_conversion_mapping_cache is None:
         _checkpoint_conversion_mapping_cache = _build_checkpoint_conversion_mapping()
     mapping = _checkpoint_conversion_mapping_cache.get(model_type)
-    if mapping is None and model_type == "klm" and config is not None:
-        return _get_klm_conversion_mapping(config)
+    if callable(mapping):
+        return mapping(config) if config is not None else None
     return deepcopy(mapping)
 
 

@@ -1249,6 +1249,35 @@ def _patch_bucketize(original):
     return patch
 
 
+@register_patch("onnx", "torch.linalg.solve_triangular")
+@register_patch("openvino", "torch.linalg.solve_triangular")
+@register_patch("executorch", "torch.linalg.solve_triangular")
+def _patch_solve_triangular(original):
+    """Decompose `solve_triangular` into a substitution, one row of the solution at a time. As many steps
+    as the system has rows instead of a single call, but no backend has the op.
+    """
+
+    def patch(A, B, *, upper, left=True, unitriangular=False, out=None):
+        if not left:
+            # `X A = B` is `A^T X^T = B^T`
+            result = patch(A.mT, B.mT, upper=not upper, unitriangular=unitriangular).mT
+            return out.copy_(result) if out is not None else result
+        rows = []
+        size = A.shape[-1]
+        for index in range(size - 1, -1, -1) if upper else range(size):
+            row = B[..., index, :]
+            if rows:
+                solved = A[..., index, index + 1 :] if upper else A[..., index, :index]
+                row = row - (solved.unsqueeze(-1) * torch.stack(rows, dim=-2)).sum(dim=-2)
+            if not unitriangular:
+                row = row / A[..., index, index, None]
+            rows = [row, *rows] if upper else [*rows, row]
+        result = torch.stack(rows, dim=-2)
+        return out.copy_(result) if out is not None else result
+
+    return patch
+
+
 @register_patch("onnx", "transformers.masking_utils._vmap_expansion_sdpa")
 @register_patch("openvino", "transformers.masking_utils._vmap_expansion_sdpa")
 @register_patch("executorch", "transformers.masking_utils._vmap_expansion_sdpa")

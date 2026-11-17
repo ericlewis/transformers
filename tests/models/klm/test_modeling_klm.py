@@ -13,12 +13,16 @@
 # limitations under the License.
 """Testing suite for the PyTorch KLM model."""
 
+import json
+import re
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from parameterized import parameterized
 
-from transformers import KlmConfig, is_torch_available
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, KlmConfig, is_torch_available
 from transformers.testing_utils import cleanup, require_torch, slow, torch_device
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
@@ -27,6 +31,7 @@ from ...test_modeling_common import ids_tensor
 
 if is_torch_available():
     import torch
+    from safetensors.torch import save_file
 
     from transformers import AutoTokenizer, DynamicCache, KlmForCausalLM, KlmModel
     from transformers.models.klm.modeling_klm import (
@@ -325,8 +330,95 @@ class KlmModelTest(CausalLMModelTest, unittest.TestCase):
 
 
 @require_torch
+class KlmOriginalCheckpointTest(unittest.TestCase):
+    def _original_checkpoint(self, directory):
+        config = {
+            "model_type": "klm",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 24,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "attention_every": 2,
+            "gdn_heads": 2,
+            "gdn_head_dim": 8,
+            "gdn_norm_eps": 2e-5,
+            "decay_floor": -12.0,
+            "n_bigrams": 7,
+            "n_trigrams": 5,
+            "ngram_dim": 4,
+            "rope_theta": 12345.0,
+            "tie_word_embeddings": True,
+        }
+        # The config reads the original names
+        model = KlmForCausalLM(KlmConfig(**config)).eval()
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name.endswith(("_residual.query", "_residual.weight")):
+                    parameter.normal_()
+        original = {}
+        residuals = {"query": [], "weight": []}
+        for name, tensor in model.state_dict().items():
+            if name == "lm_head.weight":
+                continue
+            if name.endswith(("_residual.query", "_residual.weight")):
+                # The original keeps one row for each of them in two matrices
+                residuals[name.rsplit(".", 1)[1]].append(tensor.clone())
+                continue
+            name = name.replace("model.embed_tokens.", "model.embed.")
+            name = name.replace("model.embed_ngrams.", "model.memory.")
+            name = name.replace("bigram_embeddings.", "bigram.").replace("trigram_embeddings.", "trigram.")
+            name = name.replace("model.layers.", "model.blocks.")
+            name = name.replace(".input_layernorm.", ".mixer_norm.")
+            name = name.replace(".post_attention_layernorm.", ".ffn_norm.")
+            name = re.sub(r"\.mlp\.(gate|up|down)_proj\.", r".ffn.\1.", name)
+            name = name.replace(".self_attn.", ".mixer.").replace(".linear_attn.", ".mixer.")
+            name = re.sub(r"\.(f|g)_a_proj\.", r".\1_proj.0.", name)
+            name = re.sub(r"\.(f|g)_b_proj\.", r".\1_proj.1.", name)
+            if name.endswith(".mixer.conv1d.weight"):
+                for component, weight in zip("qkv", tensor.chunk(3, dim=0)):
+                    original[name.replace("conv1d", f"{component}_conv1d")] = weight.clone()
+            else:
+                original[name] = tensor.clone()
+        original["model.attn_res_query"] = torch.stack(residuals["query"])
+        original["model.attn_res_norm"] = torch.stack(residuals["weight"])
+        Path(directory, "config.json").write_text(json.dumps(config), encoding="utf-8")
+        save_file(original, Path(directory, "model.safetensors"))
+        return model
+
+    def test_native_loading_and_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reference = self._original_checkpoint(directory)
+            config = AutoConfig.from_pretrained(directory)
+            self.assertEqual(config.linear_num_heads, 2)
+            self.assertEqual(config.linear_head_dim, 8)
+            self.assertEqual(config.num_bigrams, 7)
+            self.assertEqual(config.layer_types, ["linear_attention", "full_attention"] * 2)
+            self.assertEqual(config.rope_parameters["rope_theta"], 12345.0)
+            input_ids = torch.tensor([[1, 4, 9, 2, 6, 7]])
+            for auto_class, expected in ((AutoModel, reference.model), (AutoModelForCausalLM, reference)):
+                with self.subTest(auto_class=auto_class.__name__):
+                    loaded, info = auto_class.from_pretrained(directory, output_loading_info=True)
+                    self.assertFalse(info["missing_keys"])
+                    self.assertFalse(info["unexpected_keys"])
+                    for key, tensor in expected.state_dict().items():
+                        torch.testing.assert_close(loaded.state_dict()[key], tensor, rtol=0, atol=0)
+                    with torch.no_grad():
+                        torch.testing.assert_close(loaded(input_ids)[0], expected(input_ids)[0])
+                    for save_original_format in (True, False):
+                        with tempfile.TemporaryDirectory() as saved:
+                            loaded.save_pretrained(saved, save_original_format=save_original_format)
+                            restored, info = auto_class.from_pretrained(saved, output_loading_info=True)
+                            self.assertFalse(info["missing_keys"])
+                            self.assertFalse(info["unexpected_keys"])
+                            for key, tensor in loaded.state_dict().items():
+                                torch.testing.assert_close(restored.state_dict()[key], tensor, rtol=0, atol=0)
+
+
+@require_torch
 class KlmIntegrationTest(unittest.TestCase):
-    # The original checkpoint, converted with `convert_klm_weights_to_hf.py`
+    # The original checkpoint, its names are converted when it is loaded
     checkpoint = "MinimaLabs/KLM-1.6"
 
     def setUp(self):

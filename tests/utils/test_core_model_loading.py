@@ -38,6 +38,8 @@ from transformers.core_model_loading import (
     PrefixChange,
     Split,
     SplitModulelist,
+    Stack,
+    Unbind,
     VisionFuseAndPermuteForRope,
     VisionUnfuseAndPermuteForRope,
     WeightConverter,
@@ -1427,6 +1429,35 @@ class TestConvertAndLoadStateDict(unittest.TestCase):
             key: value for key, value in saved.items() if any(x in key for x in ["q_proj", "k_proj", "v_proj"])
         }
         self.assertTrue(compare_state_dicts(saved_qkv, state_dict))
+
+
+class TestUnbindAndStack(unittest.TestCase):
+    def test_unbind_and_stack_roundtrip(self):
+        matrix = torch.arange(12).reshape(3, 4)
+        split = Unbind(dim=0)
+        rows = split.convert({"bank": [matrix]}, ["bank"], ["a", "b", "c"])
+        self.assertEqual(rows["a"].shape, (4,))
+        # Collection order must not change the original row order when saving.
+        restored = split.reverse_op.convert({key: [rows[key]] for key in ("c", "a", "b")}, ["a", "b", "c"], ["bank"])
+        torch.testing.assert_close(restored["bank"], matrix, rtol=0, atol=0)
+        for inputs, targets in (
+            ({}, ["a", "b", "c"]),
+            ({"bank": [matrix, matrix]}, ["a", "b", "c"]),
+            ({"bank": matrix, "other": matrix}, ["a", "b", "c"]),
+            ({"bank": matrix}, ["a", "b"]),
+            ({"bank": matrix}, ["a", "a", "c"]),
+        ):
+            with self.assertRaises(ValueError):
+                split.convert(inputs, ["bank"], targets)
+        for inputs, sources in (
+            ({"a": [matrix, matrix]}, ["a"]),
+            ({"a": matrix, "b": matrix}, ["a"]),
+            ({"a": matrix}, ["a", "b"]),
+            ({"a": matrix}, ["a", "a"]),
+            ({}, []),
+        ):
+            with self.assertRaises(ValueError):
+                Stack().convert(inputs, sources, ["bank"])
 
 
 class TestConversionMapping(unittest.TestCase):
